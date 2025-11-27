@@ -1,0 +1,23 @@
+{
+  "name": "whatsapp-service-baileys-7",
+  "version": "1.0.0",
+  "description": "API Gateway WhatsApp Lokal untuk Laravel Absensi",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "express": "^4.21.1",
+    "pino": "^9.5.0",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "keywords": [
+    "whatsapp",
+    "baileys",
+    "laravel",
+    "api"
+  ],
+  "author": "Laravel Absensi Team",
+  "license": "ISC"
+}
