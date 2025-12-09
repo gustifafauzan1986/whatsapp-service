@@ -11,136 +11,97 @@ const express = require('express');
 const qrcode = require('qrcode-terminal');
 
 const app = express();
-app.use(express.json()); // Middleware untuk parsing JSON body dari Laravel
+app.use(express.json()); // Middleware parsing JSON
 
-// Variabel global untuk menyimpan instance socket WA
 let sock;
 
-// Fungsi utama untuk menghubungkan ke WhatsApp
 async function connectToWhatsApp() {
-    // 1. Setup Auth: Menyimpan sesi login di folder 'auth_info_baileys'
-    // Ini penting agar tidak perlu scan QR ulang setiap kali server restart
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
-    
-    // Fetch versi terbaru WA Web agar tidak dianggap bot usang
-    const { version, isLatest } = await fetchLatestBaileysVersion();
-    console.log(`Menggunakan WA v${version.join('.')}, isLatest: ${isLatest}`);
+    const { version } = await fetchLatestBaileysVersion();
 
-    // 2. Inisialisasi Socket
     sock = makeWASocket({
         version,
         auth: state,
-        printQRInTerminal: false, // Kita handle manual agar tampilan lebih rapi
-        logger: pino({ level: 'silent' }), // Log level silent agar terminal bersih dari debug info
-        browser: Browsers.macOS('Chrome'), // Identitas browser (bisa diganti Ubuntu/Windows)
-        syncFullHistory: false, // Matikan sync history chat lama agar startup cepat
-        generateHighQualityLinkPreview: true,
+        printQRInTerminal: false,
+        logger: pino({ level: 'silent' }),
+        browser: Browsers.macOS('Chrome'),
+        syncFullHistory: false
     });
 
-    // 3. Event Listener: Update Koneksi (QR, Connecting, Open, Close)
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
 
-        // Jika butuh Scan QR
         if (qr) {
-            console.log('\n================================================');
-            console.log('SILAKAN SCAN QR CODE INI DI WHATSAPP (LINKED DEVICES):');
-            console.log('================================================');
+            console.log('SCAN QR CODE DI BAWAH INI:');
             qrcode.generate(qr, { small: true });
         }
 
-        // Jika Koneksi Terputus
         if (connection === 'close') {
-            // Deteksi alasan putus koneksi
             const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
-            
-            console.log('Koneksi terputus. Alasan:', lastDisconnect?.error?.message || 'Unknown');
-            
-            // Reconnect otomatis jika bukan karena Logout manual dari HP
+            console.log('Koneksi terputus. Reconnecting...', shouldReconnect);
             if (shouldReconnect) {
-                console.log('Mencoba menghubungkan kembali dalam 3 detik...');
                 setTimeout(connectToWhatsApp, 3000);
-            } else {
-                console.log('Sesi Anda telah logout. Silakan hapus folder "auth_info_baileys" dan scan ulang.');
-                // Hapus kredensial jika logout (opsional)
-                // fs.rmdirSync('auth_info_baileys', { recursive: true });
             }
         } else if (connection === 'open') {
-            console.log('\n================================================');
-            console.log('✅ WHATSAPP TERHUBUNG! SIAP MENERIMA PESAN DARI LARAVEL.');
-            console.log('================================================');
+            console.log('✅ WA SERVICE SIAP! (Support Text & Media)');
         }
     });
 
-    // 4. Event Listener: Simpan Kredensial
-    // Penting: Simpan setiap perubahan sesi (kunci enkripsi baru) agar login awet
     sock.ev.on('creds.update', saveCreds);
 }
 
-// Jalankan fungsi koneksi
 connectToWhatsApp();
 
-// ------------------------------------------------------------------
-// API ENDPOINT (JEMBATAN ANTARA LARAVEL DAN WHATSAPP)
-// ------------------------------------------------------------------
+// --- API ENDPOINT UTAMA ---
 app.post('/send-message', async (req, res) => {
     try {
-        const { number, message } = req.body;
+        // Parameter dari Laravel Job
+        const { number, message, type = 'text', media_url, file_name, mime_type } = req.body;
 
-        // Validasi Input
-        if (!number || !message) {
-            return res.status(400).json({ 
-                status: 'error', 
-                message: 'Parameter "number" dan "message" wajib diisi.' 
-            });
+        // Validasi
+        if (!number) return res.status(400).json({ status: 'error', message: 'Nomor wajib diisi' });
+        if (!sock) return res.status(500).json({ status: 'error', message: 'WA belum siap' });
+
+        // Format Nomor HP (08xx -> 628xx)
+        let formattedNumber = number.toString().replace(/\D/g, '');
+        if (formattedNumber.startsWith('0')) formattedNumber = '62' + formattedNumber.slice(1);
+        if (!formattedNumber.endsWith('@s.whatsapp.net')) formattedNumber += '@s.whatsapp.net';
+
+        // Susun Konten Pesan Berdasarkan Tipe
+        let content = {};
+
+        if (type === 'image') {
+            // Kirim Gambar
+            content = { 
+                image: { url: media_url }, // Baileys akan download otomatis dari URL ini
+                caption: message 
+            };
+        } else if (type === 'document') {
+            // Kirim Dokumen
+            content = { 
+                document: { url: media_url }, 
+                caption: message,
+                mimetype: mime_type || 'application/pdf',
+                fileName: file_name || 'document.pdf'
+            };
+        } else {
+            // Kirim Teks Biasa
+            content = { text: message };
         }
 
-        // Format Nomor HP (Pembersihan karakter)
-        // Hapus semua karakter selain angka
-        let formattedNumber = number.toString().replace(/\D/g, ''); 
-
-        // Ubah awalan 08... atau 0... menjadi 62...
-        if (formattedNumber.startsWith('0')) {
-            formattedNumber = '62' + formattedNumber.slice(1);
-        }
-
-        // Tambahkan domain WhatsApp (@s.whatsapp.net) jika belum ada
-        if (!formattedNumber.endsWith('@s.whatsapp.net')) {
-            formattedNumber += '@s.whatsapp.net';
-        }
-
-        // Cek Kesiapan Socket
-        if (!sock) {
-            return res.status(500).json({ 
-                status: 'error', 
-                message: 'Layanan WA belum siap/terhubung.' 
-            });
-        }
-
-        // --- PROSES KIRIM PESAN ---
-        // Menggunakan fungsi sendMessage bawaan Baileys
-        const sentMsg = await sock.sendMessage(formattedNumber, { text: message });
+        // Eksekusi Kirim
+        await sock.sendMessage(formattedNumber, content);
         
-        console.log(`[LOG] Pesan terkirim ke: ${formattedNumber.split('@')[0]}`);
-
-        return res.json({ 
-            status: 'success', 
-            message: 'Pesan berhasil dikirim ke antrian WhatsApp.',
-            data: sentMsg
-        });
+        console.log(`[${type.toUpperCase()}] Terkirim ke ${formattedNumber.split('@')[0]}`);
+        return res.json({ status: 'success' });
 
     } catch (error) {
-        console.error('[ERROR] Gagal kirim pesan:', error);
-        return res.status(500).json({ 
-            status: 'error', 
-            message: error.message || 'Internal Server Error' 
-        });
+        console.error('Gagal kirim:', error);
+        return res.status(500).json({ status: 'error', message: error.message });
     }
 });
 
-// Jalankan Server Express di Port 3000
 const PORT = 3000;
 app.listen(PORT, () => {
-    console.log(`\n🚀 Server API WhatsApp berjalan di port ${PORT}`);
-    console.log(`🔗 Endpoint Laravel: http://localhost:${PORT}/send-message\n`);
+    console.log(`🚀 Server berjalan di port ${PORT}`);
 });
